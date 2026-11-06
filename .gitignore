@@ -1,0 +1,15 @@
+# Exporte und Sicherungen der Vereinskasse niemals veröffentlichen
+*.json
+*.csv
+*.pdf
+*.xlsx
+*.xls
+*Sicherung*
+*Auswertung*
+*Einzelverkäufe*
+*Vergleich_Feste*
+
+# Systemdateien
+Thumbs.db
+desktop.ini
+.DS_Store
