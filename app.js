@@ -5,7 +5,7 @@
  */
 
 const SPEICHER_KEY = 'vereinskasse.v1';
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const FARBEN = { gruen: 'Grün', blau: 'Blau', orange: 'Orange', rot: 'Rot', lila: 'Lila', gelb: 'Gelb', grau: 'Grau' };
 const GELD = [5000, 2000, 1000, 500, 200, 100, 50, 20, 10];
 
@@ -58,6 +58,8 @@ function standardDaten() {
     ],
     feste: [],
     aktivesFestId: null,
+    rechnungsZaehler: 0,
+    rechnungFusszeile: '',
   };
 }
 
@@ -67,9 +69,12 @@ function migrieren(d) {
   d.kategorien = d.kategorien || [];
   d.produkte = d.produkte || [];
   d.feste = d.feste || [];
+  d.rechnungsZaehler = d.rechnungsZaehler || 0;
+  d.rechnungFusszeile = d.rechnungFusszeile ?? '';
   for (const f of d.feste) {
     f.bestand = f.bestand || {};
     f.verkaeufe = f.verkaeufe || [];
+    f.deckel = f.deckel || [];
     f.anfangsbestand = f.anfangsbestand ?? 0;
     f.endbestand = f.endbestand ?? null;
   }
@@ -109,6 +114,9 @@ const ui = {
   vergleichModus: 'menge',
   festDetailId: null,
   neuesFestOffen: false,
+  deckelId: null,          // geöffneter Deckel in der Deckel-Ansicht
+  anschreiben: null,       // {garten, name} solange der Anschreiben-Dialog offen ist
+  abrechnungErhalten: 0,   // Cent, beim Bar-Abrechnen eines Deckels
 };
 
 const produkt = id => daten.produkte.find(p => p.id === id);
@@ -116,6 +124,23 @@ const kategorie = id => daten.kategorien.find(k => k.id === id);
 const fest = id => daten.feste.find(f => f.id === id);
 const aktivesFest = () => { const f = fest(daten.aktivesFestId); return f && !f.abgeschlossen ? f : null; };
 const gueltigeVerkaeufe = f => f.verkaeufe.filter(v => !v.storniert);
+/* Deckel (Anschreiben auf Gartennummer)
+ * status: 'offen' (läuft noch) | 'rechnung' (abgerechnet, Zahlung offen) | 'bezahlt'
+ * zahlart: 'bar' (beim Abrechnen bar bezahlt, zählt in den Kassenbestand des Fests) | 'spaeter' */
+const normGarten = s => String(s ?? '').trim().replace(/\s+/g, ' ').toUpperCase();
+const deckelVerkaeufe = (f, d) => f.verkaeufe.filter(v => v.deckelId === d.id && !v.storniert);
+const deckelSumme = (f, d) => deckelVerkaeufe(f, d).reduce((s, v) => s + v.summe, 0);
+function findeDeckel(id) {
+  for (const f of daten.feste) { const d = f.deckel.find(x => x.id === id); if (d) return { f, d }; }
+  return null;
+}
+const offeneDeckel = f => f ? f.deckel.filter(d => d.status === 'offen') : [];
+const unbezahlteRechnungen = () => daten.feste.flatMap(f => f.deckel.filter(d => d.status === 'rechnung').map(d => ({ f, d })));
+const deckelTitel = d => `Garten ${d.garten}${d.name ? ' · ' + d.name : ''}`;
+const deckelStatusText = d => d.status === 'offen' ? 'offen'
+  : d.status === 'rechnung' ? 'Rechnung offen'
+  : d.zahlart === 'bar' ? 'bar bezahlt' : 'nachträglich bezahlt';
+
 const festeNachDatum = () => [...daten.feste].sort((a, b) => (a.datum || '').localeCompare(b.datum || '') || (a.angelegt || '').localeCompare(b.angelegt || ''));
 
 /* ---------- Auswertung ---------- */
@@ -123,7 +148,7 @@ function auswerten(f) {
   const vk = gueltigeVerkaeufe(f);
   const proProdukt = new Map();
   const reihenfolge = new Map(daten.produkte.map((p, i) => [p.id, i]));
-  let umsatz = 0, artikel = 0;
+  let umsatz = 0, artikel = 0, barVerkauf = 0, angeschrieben = 0;
 
   // Stunden relativ zur ersten Verkaufsstunde (Feste über Mitternacht bleiben zusammenhängend)
   const stunden = [];
@@ -132,6 +157,7 @@ function auswerten(f) {
 
   for (const v of vk) {
     umsatz += v.summe;
+    if (v.deckelId) angeschrieben += v.summe; else barVerkauf += v.summe;
     const idx = Math.floor((new Date(v.zeit).getTime() - startStunde) / 3600000);
     const st = stunden[idx] || (stunden[idx] = { umsatz: 0, anzahl: 0 });
     st.umsatz += v.summe; st.anzahl++;
@@ -175,8 +201,15 @@ function auswerten(f) {
   const kategorien = new Map();
   for (const z of zeilen) kategorien.set(z.kategorie || 'Sonstige', (kategorien.get(z.kategorie || 'Sonstige') || 0) + z.umsatz);
 
-  const soll = f.anfangsbestand + umsatz;
+  const deckel = f.deckel.map(d => ({ ...d, betrag: d.status === 'offen' ? deckelSumme(f, d) : d.summe }));
+  const summeWo = bed => deckel.filter(bed).reduce((s, d) => s + d.betrag, 0);
+  const deckelBar = summeWo(d => d.zahlart === 'bar');
+  const soll = f.anfangsbestand + barVerkauf + deckelBar;
   return {
+    barVerkauf, angeschrieben, deckel, deckelBar,
+    deckelOffen: summeWo(d => d.status === 'offen'),
+    rechnungenOffen: summeWo(d => d.status === 'rechnung'),
+    deckelNachtraeglich: summeWo(d => d.status === 'bezahlt' && d.zahlart === 'spaeter'),
     anzahl: vk.length,
     storniert: f.verkaeufe.length - vk.length,
     umsatz, artikel,
@@ -247,14 +280,17 @@ function renderBon() {
     </div>
     <div class="bon-zeile"><span>Erhalten</span><strong>${erh ? euro(erh) : '–'}</strong></div>
     <div class="bon-zeile wechsel"><span>Wechselgeld</span><strong>${wg}</strong></div>
-    <button class="btn primaer gross" data-action="bezahlt" ${!summe || (erh && erh < summe) ? 'disabled' : ''}>Bezahlt ✓</button>
-    <div class="bon-fuss"><span>${vk.length} Verkäufe · ${euro(ums)}</span>${vk.length ? '<button class="link" data-action="storno">Letzten stornieren</button>' : ''}</div>`;
+    <div class="bon-knoepfe">
+      <button class="btn anschreiben" data-action="anschreiben-oeffnen" ${summe ? '' : 'disabled'}>Anschreiben</button>
+      <button class="btn primaer gross" data-action="bezahlt" ${!summe || (erh && erh < summe) ? 'disabled' : ''}>Bezahlt ✓</button>
+    </div>
+    <div class="bon-fuss"><span>${vk.length} Verkäufe · ${euro(ums)}${offeneDeckel(f).length ? ` · <button class="link" data-action="nav" data-ansicht="deckel">${offeneDeckel(f).length} Deckel offen</button>` : ''}</span>${vk.length ? '<button class="link" data-action="storno">Letzten stornieren</button>' : ''}</div>`;
 }
 
 /** Aktualisiert nur Warenkorb und Mengen-Plaketten, damit die Scrollposition erhalten bleibt */
 function aktualisiereKasse() {
   const bon = $('#bon');
-  if (!bon) return render();
+  if (!bon) return;   // kein aktives Fest: es gibt keinen Warenkorb (früher Endlosschleife über render)
   bon.innerHTML = renderBon();
   for (const el of $$('[data-menge]')) {
     const m = ui.warenkorb.find(w => w.produktId === el.dataset.menge)?.menge || 0;
@@ -262,34 +298,244 @@ function aktualisiereKasse() {
     el.textContent = m;
   }
   $('#fest-anzeige').textContent = festAnzeige();
+  aktualisiereDeckelZahl();
 }
 
-function buchen() {
+/** Bucht den Warenkorb. Mit deckel: auf den Deckel anschreiben statt bar kassieren. */
+function buchen(deckel = null) {
   const f = aktivesFest();
   if (!f || !ui.warenkorb.length) return;
   const summe = warenkorbSumme();
-  const erhalten = ui.erhalten || summe;
-  if (erhalten < summe) return;
+  const erhalten = deckel ? 0 : (ui.erhalten || summe);
+  if (!deckel && erhalten < summe) return;
   const positionen = ui.warenkorb.map(w => {
     const p = produkt(w.produktId);
     return { produktId: p.id, name: p.name, kategorie: kategorie(p.kategorieId)?.name || '', preis: p.preis, menge: w.menge };
   });
-  f.verkaeufe.push({ id: uid(), zeit: new Date().toISOString(), positionen, summe, erhalten, storniert: false });
+  const verkauf = { id: uid(), zeit: new Date().toISOString(), positionen, summe, erhalten, storniert: false };
+  if (deckel) verkauf.deckelId = deckel.id;
+  f.verkaeufe.push(verkauf);
   speichern();
   ui.warenkorb = [];
   ui.erhalten = 0;
-  toast(`Gebucht: ${euro(summe)}` + (erhalten > summe ? ` · Wechselgeld ${euro(erhalten - summe)}` : ''));
+  if (deckel) toast(`${euro(summe)} angeschrieben auf Garten ${deckel.garten} · Deckel jetzt ${euro(deckelSumme(f, deckel))}`);
+  else toast(`Gebucht: ${euro(summe)}` + (erhalten > summe ? ` · Wechselgeld ${euro(erhalten - summe)}` : ''));
   aktualisiereKasse();
+}
+
+/* ---------- Anschreiben-Dialog ---------- */
+function renderAnschreiben() {
+  const f = aktivesFest();
+  const a = ui.anschreiben;
+  if (!f || !a) return '';
+  const offen = offeneDeckel(f);
+  return `<div class="modal-hg" data-action="modal-zu-hg"><div class="modal" role="dialog" aria-modal="true" aria-label="Anschreiben">
+    <div class="modal-kopf"><h2>Anschreiben: ${euro(warenkorbSumme())}</h2><button class="rund" data-action="modal-zu" aria-label="Schließen">✕</button></div>
+    ${offen.length ? `<p class="gedimmt" style="margin:0 0 6px">Offenen Deckel antippen, um direkt darauf zu buchen:</p>
+      <div class="chips">${offen.map(d => `<button class="chip deckel-chip" data-action="ans-deckel" data-did="${d.id}">
+        <strong>Garten ${esc(d.garten)}</strong>${d.name ? ' · ' + esc(d.name) : ''} · ${euro(deckelSumme(f, d))}</button>`).join('')}</div>` : ''}
+    <div class="ans-raster">
+      <div>
+        <label class="ans-label">Gartennummer
+          <input class="feld ans-garten" data-feld="ans-garten" value="${esc(a.garten)}" maxlength="8" autocomplete="off" aria-label="Gartennummer"></label>
+        <div class="ziffern">
+          ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map(z => `<button data-action="ziffer" data-z="${z}">${z}</button>`).join('')}
+          <button data-action="ziffer-c" aria-label="Löschen">C</button><button data-action="ziffer" data-z="0">0</button><button data-action="ziffer-weg" aria-label="Letzte Ziffer löschen">⌫</button>
+        </div>
+      </div>
+      <div class="ans-rechts">
+        <label>Name (optional)<input class="feld" data-feld="ans-name" value="${esc(a.name)}" placeholder="z. B. Familie Müller" autocomplete="off"></label>
+        <p class="ans-hinweis" id="ans-hinweis">${anschreibenHinweis()}</p>
+        <button class="btn primaer gross" data-action="ans-ok" id="ans-ok" ${normGarten(a.garten) ? '' : 'disabled'}>Auf Garten <span id="ans-nr">${esc(normGarten(a.garten)) || '…'}</span> anschreiben</button>
+      </div>
+    </div></div></div>`;
+}
+
+function anschreibenHinweis() {
+  const f = aktivesFest();
+  const g = normGarten(ui.anschreiben?.garten);
+  if (!g) return 'Gartennummer eingeben.';
+  const d = offeneDeckel(f).find(x => x.garten === g);
+  const summe = warenkorbSumme();
+  return d ? `Deckel vorhanden${d.name ? ' (' + esc(d.name) + ')' : ''}: ${euro(deckelSumme(f, d))} → danach ${euro(deckelSumme(f, d) + summe)}`
+    : `Neuer Deckel für Garten ${esc(g)} wird angelegt.`;
+}
+
+/** Aktualisiert Hinweis und Knopf, ohne den Dialog neu zu zeichnen (Fokus bleibt im Eingabefeld) */
+function aktualisiereAnschreiben() {
+  const g = normGarten(ui.anschreiben.garten);
+  $('#ans-hinweis').innerHTML = anschreibenHinweis();
+  $('#ans-nr').textContent = g || '…';
+  $('#ans-ok').disabled = !g;
+}
+
+function renderModal() {
+  $('#modal').innerHTML = ui.anschreiben ? renderAnschreiben() : '';
+}
+
+function anschreibenAuf(d) {
+  const f = aktivesFest();
+  if (!f || !ui.warenkorb.length) return;
+  ui.anschreiben = null;
+  renderModal();
+  buchen(d);
+}
+
+function anschreibenOk() {
+  const f = aktivesFest();
+  const g = normGarten(ui.anschreiben.garten);
+  if (!g) return;
+  const name = ui.anschreiben.name.trim();
+  let d = offeneDeckel(f).find(x => x.garten === g);
+  if (!d) {
+    d = { id: uid(), garten: g, name, angelegt: new Date().toISOString(), status: 'offen', zahlart: null, summe: 0 };
+    f.deckel.push(d);
+  } else if (name && !d.name) {
+    d.name = name;
+  }
+  anschreibenAuf(d);
 }
 
 function stornieren(f, v) {
   if (!v) return;
+  if (v.deckelId) {
+    const d = f.deckel.find(x => x.id === v.deckelId);
+    if (d && d.status !== 'offen') return toast(`Gehört zu einem bereits abgerechneten Deckel (Garten ${d.garten}) und kann nicht mehr storniert werden.`, 'fehler');
+  }
   const text = v.positionen.map(p => `${p.menge}× ${p.name}`).join(', ');
-  if (!confirm(`Verkauf von ${uhrzeit(v.zeit)} Uhr stornieren?\n\n${text}\nSumme: ${euro(v.summe)}`)) return;
+  const garten = v.deckelId ? ` (angeschrieben auf Garten ${f.deckel.find(x => x.id === v.deckelId)?.garten})` : '';
+  if (!confirm(`Verkauf von ${uhrzeit(v.zeit)} Uhr${garten} stornieren?\n\n${text}\nSumme: ${euro(v.summe)}`)) return;
   v.storniert = true;
   v.stornoZeit = new Date().toISOString();
   speichern();
   toast('Verkauf storniert');
+}
+
+/* ---------- Deckel-Ansicht ---------- */
+function renderDeckelListe() {
+  const r = ui.deckelId && findeDeckel(ui.deckelId);
+  if (r) return renderDeckelDetail(r.f, r.d);
+  ui.deckelId = null;
+  const f = aktivesFest();
+  const offen = offeneDeckel(f);
+  const unbezahlt = unbezahlteRechnungen();
+  const erledigt = f ? f.deckel.filter(d => d.status === 'bezahlt') : [];
+  const kachel = d => `<button class="deckel-kachel" data-action="deckel-oeffnen" data-did="${d.id}">
+    <span class="nr">Garten ${esc(d.garten)}</span><span class="gedimmt">${esc(d.name) || '&nbsp;'}</span>
+    <span class="betrag">${euro(deckelSumme(f, d))}</span><span class="gedimmt">${deckelVerkaeufe(f, d).length} Buchungen · seit ${uhrzeit(d.angelegt)} Uhr</span></button>`;
+  const zeile = (x, d, knopf) => `<tr><td><button class="link" data-action="deckel-oeffnen" data-did="${d.id}">${esc(deckelTitel(d))}</button></td>
+    <td>${esc(x.name)} (${datumDE(x.datum)})</td><td>${esc(d.rechnungNr || '')}</td><td class="zahl">${euro(d.summe)}</td><td>${esc(deckelStatusText(d))}</td><td>${knopf}</td></tr>`;
+  return `<div class="seite">
+    <div class="seite-kopf"><h1>Deckel <small>${f ? esc(f.name) : 'kein aktives Fest'}</small></h1></div>
+    <section class="karte"><h2>Offene Deckel (${offen.length}${offen.length ? ' · ' + euro(offen.reduce((s, d) => s + deckelSumme(f, d), 0)) : ''})</h2>
+      ${offen.length ? `<div class="deckel-kacheln">${offen.map(kachel).join('')}</div>`
+        : '<p class="leer">Keine offenen Deckel. Angeschrieben wird an der Kasse über den Knopf „Anschreiben".</p>'}
+    </section>
+    ${unbezahlt.length ? `<section class="karte"><h2>Unbezahlte Rechnungen, alle Feste (${unbezahlt.length} · ${euro(unbezahlt.reduce((s, x) => s + x.d.summe, 0))})</h2>
+      <div class="tabelle-scroll"><table class="tabelle"><thead><tr><th>Deckel</th><th>Fest</th><th>Rechnung</th><th class="zahl">Betrag</th><th>Status</th><th></th></tr></thead>
+      <tbody>${unbezahlt.map(({ f: x, d }) => zeile(x, d, `<button class="btn klein" data-action="deckel-bezahlt" data-did="${d.id}">Als bezahlt markieren</button>`)).join('')}</tbody></table></div>
+    </section>` : ''}
+    ${erledigt.length ? `<section class="karte"><h2>Bezahlt (dieses Fest)</h2>
+      <div class="tabelle-scroll"><table class="tabelle"><thead><tr><th>Deckel</th><th>Fest</th><th>Rechnung</th><th class="zahl">Betrag</th><th>Status</th><th></th></tr></thead>
+      <tbody>${erledigt.map(d => zeile(f, d, '')).join('')}</tbody></table></div>
+    </section>` : ''}
+  </div>`;
+}
+
+function renderDeckelDetail(f, d) {
+  const offen = d.status === 'offen';
+  const vk = deckelVerkaeufe(f, d);
+  const summe = offen ? deckelSumme(f, d) : d.summe;
+  const datum = offen ? new Date().toISOString() : d.abgerechnet;
+  const zeilen = vk.flatMap(v => v.positionen.map((p, i) => `<tr>
+    <td>${i === 0 ? uhrzeit(v.zeit) + ' Uhr' : ''}</td><td>${esc(p.name)}</td><td class="zahl">${p.menge}</td>
+    <td class="zahl">${euro(p.preis)}</td><td class="zahl">${euro(p.preis * p.menge)}</td>
+    ${offen ? `<td class="nicht-drucken">${i === 0 ? `<button class="btn klein" data-action="deckel-storno" data-vid="${v.id}">Stornieren</button>` : ''}</td>` : ''}
+  </tr>`)).join('');
+  let zahlung = '';
+  if (d.status === 'bezahlt') zahlung = d.zahlart === 'bar' ? `Bar bezahlt am ${new Date(d.bezahltAm).toLocaleDateString('de-DE')}.` : `Bezahlt am ${new Date(d.bezahltAm).toLocaleDateString('de-DE')}.`;
+  else if (d.status === 'rechnung') zahlung = 'Zahlung noch offen.';
+
+  return `<div class="seite">
+    <div class="seite-kopf nicht-drucken"><button class="btn" data-action="deckel-zurueck">← Alle Deckel</button>
+      <div class="knoepfe">
+        ${d.status === 'rechnung' ? `<button class="btn" data-action="deckel-bezahlt" data-did="${d.id}">Als bezahlt markieren</button>` : ''}
+        ${vk.length ? `<button class="btn ${offen ? '' : 'primaer'}" data-action="drucken">${offen ? 'Vorläufige Aufstellung drucken' : 'Rechnung drucken / PDF'}</button>` : ''}
+      </div></div>
+    <div class="rechnung">
+      <div class="rechnung-kopf">
+        <div><div class="verein">${esc(daten.vereinsname)}</div><div class="gedimmt">${esc(f.name)} · ${datumDE(f.datum)}</div></div>
+        <div style="text-align:right"><h1>${offen ? 'Deckel (vorläufig)' : 'Rechnung'}</h1>
+          ${d.rechnungNr ? `<div>Nr. ${esc(d.rechnungNr)}</div>` : ''}<div>Datum: ${new Date(datum).toLocaleDateString('de-DE')}</div></div>
+      </div>
+      <div class="rechnung-an"><span class="gedimmt">Für</span><br><strong style="font-size:1.3rem">Garten ${esc(d.garten)}</strong>
+        ${offen ? `<input class="feld nicht-drucken" style="max-width:320px;margin-top:6px" data-feld="d-name" data-did="${d.id}" value="${esc(d.name)}" placeholder="Name (optional)">
+          ${d.name ? `<div class="nur-druck">${esc(d.name)}</div>` : ''}` : (d.name ? `<div>${esc(d.name)}</div>` : '')}
+      </div>
+      <div class="tabelle-scroll"><table class="tabelle">
+        <thead><tr><th>Uhrzeit</th><th>Artikel</th><th class="zahl">Menge</th><th class="zahl">Einzelpreis</th><th class="zahl">Betrag</th>${offen ? '<th class="nicht-drucken"></th>' : ''}</tr></thead>
+        <tbody>${zeilen || `<tr><td colspan="6" class="leer">Keine Buchungen auf diesem Deckel.</td></tr>`}</tbody>
+        <tfoot><tr class="rechnung-summe"><td colspan="4">Gesamtbetrag</td><td class="zahl">${euro(summe)}</td>${offen ? '<td class="nicht-drucken"></td>' : ''}</tr></tfoot>
+      </table></div>
+      ${zahlung ? `<p><strong>${zahlung}</strong></p>` : ''}
+      ${daten.rechnungFusszeile.trim() ? `<div class="fusszeile">${esc(daten.rechnungFusszeile)}</div>` : ''}
+    </div>
+    ${offen ? (vk.length ? `<section class="karte nicht-drucken abrechnen" id="abr-panel">${renderAbrechnenPanel(f, d)}</section>`
+      : `<p class="nicht-drucken"><button class="btn gefahr" data-action="deckel-entfernen" data-did="${d.id}">Leeren Deckel entfernen</button></p>`) : ''}
+  </div>`;
+}
+
+function renderAbrechnenPanel(f, d) {
+  const summe = deckelSumme(f, d);
+  const erh = ui.abrechnungErhalten;
+  let wg = '<span class="gedimmt">–</span>';
+  if (erh && erh < summe) wg = `<span class="fehlt">fehlt ${euro(summe - erh)}</span>`;
+  else if (erh) wg = euro(erh - summe);
+  const geldText = c => c >= 100 ? `${c / 100} €` : `${c} ct`;
+  return `<h2>Abrechnen: ${euro(summe)}</h2>
+    <div class="abr-raster">
+      <div>
+        <p class="gedimmt" style="margin:0 0 6px">Bar bezahlt? Erhaltenes Geld antippen:</p>
+        <div class="geld">
+          ${GELD.map(c => `<button class="geld-btn" data-action="abr-geld" data-wert="${c}">${geldText(c)}</button>`).join('')}
+          <button class="geld-btn passend" data-action="abr-passend">Passend</button>
+          <button class="geld-btn" data-action="abr-c" ${erh ? '' : 'disabled'}>C</button>
+        </div>
+      </div>
+      <div class="abr-rechts">
+        <div class="bon-zeile"><span>Erhalten</span><strong>${erh ? euro(erh) : '–'}</strong></div>
+        <div class="bon-zeile wechsel"><span>Wechselgeld</span><strong>${wg}</strong></div>
+        <button class="btn primaer gross" data-action="abr-bar" data-did="${d.id}" ${erh && erh < summe ? 'disabled' : ''}>Bar bezahlt ✓</button>
+        <button class="btn" data-action="abr-spaeter" data-did="${d.id}">Später bezahlen (Rechnung bleibt offen)</button>
+      </div>
+    </div>`;
+}
+
+function aktualisiereAbrechnen() {
+  const r = findeDeckel(ui.deckelId);
+  const el = $('#abr-panel');
+  if (r && el) el.innerHTML = renderAbrechnenPanel(r.f, r.d);
+}
+
+function neueRechnungsNr(f) {
+  daten.rechnungsZaehler++;
+  return `${(f.datum || heute()).slice(0, 4)}-${String(daten.rechnungsZaehler).padStart(4, '0')}`;
+}
+
+function deckelAbrechnen(id, zahlart) {
+  const { f, d } = findeDeckel(id);
+  const summe = deckelSumme(f, d);
+  if (!summe) return toast('Deckel ist leer', 'fehler');
+  const erh = ui.abrechnungErhalten || summe;
+  if (zahlart === 'bar' && erh < summe) return;
+  if (zahlart === 'spaeter' && !confirm(`Rechnung über ${euro(summe)} für Garten ${d.garten} ausstellen?\nDie Zahlung bleibt offen, bis sie als bezahlt markiert wird.`)) return;
+  const jetzt = new Date().toISOString();
+  Object.assign(d, { summe, zahlart, abgerechnet: jetzt, rechnungNr: neueRechnungsNr(f),
+    status: zahlart === 'bar' ? 'bezahlt' : 'rechnung', bezahltAm: zahlart === 'bar' ? jetzt : null, erhalten: zahlart === 'bar' ? erh : null });
+  speichern();
+  ui.abrechnungErhalten = 0;
+  toast(zahlart === 'bar' ? `Garten ${d.garten} bar abgerechnet` + (erh > summe ? ` · Wechselgeld ${euro(erh - summe)}` : '') : `Rechnung ${d.rechnungNr} ausgestellt, Zahlung offen`);
+  render();
 }
 
 /* ---------- Feste ---------- */
@@ -344,7 +590,7 @@ function festNeuAnlegen(form) {
   if (!name) return toast('Bitte einen Namen eingeben', 'fehler');
   if (Number.isNaN(anfang)) return toast('Anfangsbestand ungültig', 'fehler');
   const f = { id: uid(), name, datum: fd.get('datum') || heute(), anfangsbestand: anfang || 0, endbestand: null,
-    abgeschlossen: false, bestand: {}, verkaeufe: [], angelegt: new Date().toISOString() };
+    abgeschlossen: false, bestand: {}, verkaeufe: [], deckel: [], angelegt: new Date().toISOString() };
   const vorlage = fest(fd.get('vorlage'));
   if (vorlage) {
     for (const z of auswerten(vorlage).zeilen) {
@@ -405,18 +651,18 @@ function renderFestDetail(f) {
     <section class="karte"><h2>Kassenabschluss</h2>
       <div class="tabelle-scroll"><table class="tabelle">
         <tr><td>Wechselgeld-Anfangsbestand</td><td><input class="mini" inputmode="decimal" data-feld="f-anfang" value="${zahlDE(f.anfangsbestand)}" ${gesperrt}></td></tr>
-        <tr><td>Einnahmen laut Kasse</td><td class="zahl" data-zelle="umsatz">${euro(a.umsatz)}</td></tr>
-        <tr><td><strong>Soll-Bestand</strong></td><td class="zahl" data-zelle="soll"><strong>${euro(a.soll)}</strong></td></tr>
+        ${kassenZeilen(a)}
         <tr><td>Gezählter Bestand nach dem Fest</td><td><input class="mini" inputmode="decimal" data-feld="f-ende" value="${f.endbestand != null ? zahlDE(f.endbestand) : ''}" placeholder="0,00" ${gesperrt}></td></tr>
         <tr><td><strong>Differenz (Ist − Soll)</strong></td><td class="zahl" data-zelle="differenz">${differenzText(a.differenz)}</td></tr>
       </table></div>
+      ${deckelHinweis(a)}
     </section>
 
     <section class="karte"><details><summary>Verkaufsjournal (${f.verkaeufe.length} Buchungen, davon ${a.storniert} storniert)</summary>
       <div class="tabelle-scroll"><table class="tabelle">
         <thead><tr><th>Uhrzeit</th><th>Positionen</th><th class="zahl">Summe</th><th></th></tr></thead>
         <tbody>${journal.map(v => `<tr class="${v.storniert ? 'storniert' : ''}"><td>${uhrzeit(v.zeit)}</td>
-          <td>${esc(v.positionen.map(p => `${p.menge}× ${p.name}`).join(', '))}</td><td class="zahl">${euro(v.summe)}</td>
+          <td>${esc(v.positionen.map(p => `${p.menge}× ${p.name}`).join(', '))}${v.deckelId ? ` <span class="tag">Garten ${esc(f.deckel.find(d => d.id === v.deckelId)?.garten)}</span>` : ''}</td><td class="zahl">${euro(v.summe)}</td>
           <td>${v.storniert ? '<span class="tag rot">storniert</span>' : f.abgeschlossen ? '' : `<button class="btn klein" data-action="journal-storno" data-vid="${v.id}">Stornieren</button>`}</td></tr>`).join('')
           || '<tr><td colspan="4" class="leer">Noch keine Verkäufe.</td></tr>'}</tbody>
       </table></div></details>
@@ -431,6 +677,20 @@ function renderFestDetail(f) {
   </div>`;
 }
 
+/** Zeilen Barverkäufe, bar abgerechnete Deckel und Soll-Bestand (Fest-Detail und Auswertung) */
+function kassenZeilen(a) {
+  return `<tr><td>Barverkäufe</td><td class="zahl">${euro(a.barVerkauf)}</td></tr>
+    ${a.deckel.length ? `<tr><td>Deckel, beim Abrechnen bar bezahlt</td><td class="zahl">${euro(a.deckelBar)}</td></tr>` : ''}
+    <tr><td><strong>Soll-Bestand</strong></td><td class="zahl" data-zelle="soll"><strong>${euro(a.soll)}</strong></td></tr>`;
+}
+function deckelHinweis(a) {
+  const teile = [];
+  if (a.deckelOffen) teile.push(`${euro(a.deckelOffen)} auf offenen Deckeln`);
+  if (a.rechnungenOffen) teile.push(`${euro(a.rechnungenOffen)} in unbezahlten Rechnungen`);
+  if (a.deckelNachtraeglich) teile.push(`${euro(a.deckelNachtraeglich)} nachträglich bezahlt`);
+  return teile.length ? `<p class="fussnote">Nicht im Kassenbestand enthalten: ${teile.join(', ')}.</p>` : '';
+}
+
 function differenzText(d) {
   if (d == null) return '<span class="gedimmt">–</span>';
   if (d === 0) return `<span class="positiv">${euro(0)} ✓</span>`;
@@ -443,7 +703,6 @@ function aktualisiereFestZellen(f) {
   for (const el of $$('[data-zelle="verkauft"]')) el.textContent = z.get(el.dataset.pid)?.menge ?? 0;
   for (const el of $$('[data-zelle="schwund"]')) el.textContent = z.get(el.dataset.pid)?.schwund ?? '–';
   const set = (k, html) => { const el = $(`[data-zelle="${k}"]`); if (el) el.innerHTML = html; };
-  set('umsatz', euro(a.umsatz));
   set('soll', `<strong>${euro(a.soll)}</strong>`);
   set('differenz', differenzText(a.differenz));
 }
@@ -537,6 +796,7 @@ function renderAuswertung() {
     ${f.abgeschlossen ? '' : '<p class="hinweis nicht-drucken">Das Fest ist noch nicht abgeschlossen; die Zahlen können sich noch ändern.</p>'}
     <div class="kpis">
       ${kpi('Einnahmen', euro(a.umsatz))}
+      ${a.angeschrieben ? kpi('davon angeschrieben', euro(a.angeschrieben)) : ''}
       ${kpi('Verkäufe', a.anzahl)}
       ${kpi('Ø je Verkauf', euro(a.durchschnitt))}
       ${kpi('Verkaufte Artikel', a.artikel)}
@@ -571,13 +831,21 @@ function renderAuswertung() {
     <section class="karte"><h2>Kassenabschluss</h2>
       <table class="tabelle"><tbody>
         <tr><td>Wechselgeld-Anfangsbestand</td><td class="zahl">${euro(f.anfangsbestand)}</td></tr>
-        <tr><td>Einnahmen laut Kasse</td><td class="zahl">${euro(a.umsatz)}</td></tr>
-        <tr><td><strong>Soll-Bestand</strong></td><td class="zahl"><strong>${euro(a.soll)}</strong></td></tr>
+        ${kassenZeilen(a)}
         <tr><td>Gezählter Bestand</td><td class="zahl">${f.endbestand != null ? euro(f.endbestand) : '–'}</td></tr>
         <tr><td><strong>Differenz (Ist − Soll)</strong></td><td class="zahl">${differenzText(a.differenz)}</td></tr>
         <tr><td>Stornierte Buchungen</td><td class="zahl">${a.storniert}</td></tr>
       </tbody></table>
+      ${deckelHinweis(a)}
     </section>
+
+    ${a.deckel.length ? `<section class="karte"><h2>Angeschrieben (${a.deckel.length} Deckel · ${euro(a.angeschrieben)})</h2>
+      <div class="tabelle-scroll"><table class="tabelle">
+        <thead><tr><th>Garten</th><th>Name</th><th>Rechnung</th><th class="zahl">Betrag</th><th>Status</th></tr></thead>
+        <tbody>${a.deckel.map(d => `<tr><td><button class="link" data-action="deckel-oeffnen" data-did="${d.id}">Garten ${esc(d.garten)}</button></td>
+          <td>${esc(d.name)}</td><td>${esc(d.rechnungNr || '–')}</td><td class="zahl">${euro(d.betrag)}</td>
+          <td>${d.status === 'bezahlt' ? esc(deckelStatusText(d)) : `<span class="tag rot">${esc(deckelStatusText(d))}</span>`}</td></tr>`).join('')}</tbody>
+      </table></div></section>` : ''}
     <div class="nur-druck unterschriften" style="display:none"><div>Datum, Kassierer/in</div><div>Datum, Kassenprüfer/in</div></div>
   </div>`;
 }
@@ -636,7 +904,10 @@ function renderDaten() {
   return `<div class="seite">
     <div class="seite-kopf"><h1>Daten und Einstellungen</h1></div>
     <section class="karte formular"><h2>Verein</h2>
-      <label>Vereinsname (erscheint auf dem PDF)<input data-feld="vereinsname" value="${esc(daten.vereinsname)}"></label>
+      <label>Vereinsname (erscheint auf PDF und Rechnungen)<input data-feld="vereinsname" value="${esc(daten.vereinsname)}"></label>
+      <label>Fußzeile der Rechnungen (optional, mehrzeilig)
+        <textarea class="feld" rows="4" data-feld="rechnung-fusszeile" placeholder="z. B. Vereinsadresse, Ansprechpartner oder „Gemäß § 19 UStG wird keine Umsatzsteuer berechnet.“">${esc(daten.rechnungFusszeile)}</textarea></label>
+      <p class="fussnote" style="margin:0">Letzte vergebene Rechnungsnummer: ${daten.rechnungsZaehler ? String(daten.rechnungsZaehler).padStart(4, '0') : 'noch keine'} (fortlaufend über alle Feste).</p>
     </section>
     <section class="karte"><h2>Sicherung</h2>
       <p>Alle Daten liegen nur auf diesem Gerät im Browser. Nach jedem Fest eine Sicherung exportieren und z. B. per Mail oder USB ablegen.
@@ -671,7 +942,7 @@ function demoFest() {
   const d = new Date(); d.setDate(d.getDate() - 7 * (daten.feste.length + 1)); d.setHours(15, 0, 0, 0);
   const datum = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   const f = { id: uid(), name: 'Beispielfest', datum, anfangsbestand: 15000, endbestand: null, abgeschlossen: true,
-    bestand: {}, verkaeufe: [], angelegt: new Date().toISOString() };
+    bestand: {}, verkaeufe: [], deckel: [], angelegt: new Date().toISOString() };
   let t = d.getTime();
   const ende = t + 8.5 * 3600000;
   while (t < ende) {
@@ -714,20 +985,30 @@ function herunterladen(name, inhalt, typ) {
 
 function csvProdukte() {
   const f = fest(ui.auswertungFestId); const a = auswerten(f);
-  const z = [['Fest', f.name], ['Datum', datumDE(f.datum)], ['Einnahmen', betragCSV(a.umsatz)], ['Verkäufe', a.anzahl], ['Ø je Verkauf', betragCSV(a.durchschnitt)],
-    ['Wechselgeld-Anfangsbestand', betragCSV(f.anfangsbestand)], ['Soll-Bestand', betragCSV(a.soll)], ['Gezählter Bestand', betragCSV(f.endbestand)], ['Differenz', betragCSV(a.differenz)], [],
+  const z = [['Fest', f.name], ['Datum', datumDE(f.datum)], ['Einnahmen', betragCSV(a.umsatz)], ['davon Barverkäufe', betragCSV(a.barVerkauf)], ['davon angeschrieben', betragCSV(a.angeschrieben)],
+    ['Verkäufe', a.anzahl], ['Ø je Verkauf', betragCSV(a.durchschnitt)],
+    ['Wechselgeld-Anfangsbestand', betragCSV(f.anfangsbestand)], ['Deckel bar abgerechnet', betragCSV(a.deckelBar)], ['Soll-Bestand', betragCSV(a.soll)],
+    ['Gezählter Bestand', betragCSV(f.endbestand)], ['Differenz', betragCSV(a.differenz)],
+    ['Offene Deckel', betragCSV(a.deckelOffen)], ['Unbezahlte Rechnungen', betragCSV(a.rechnungenOffen)], [],
     ['Produkt', 'Kategorie', 'Verkauft', 'Einnahmen €', 'Anteil %', 'Eingekauft', 'Rest', 'Schwund', 'Ausverkauft', 'EK-Preis €', 'Letzter Verkauf', 'Vorschlag nächstes Fest']];
   for (const r of a.zeilen) z.push([r.name, r.kategorie, r.menge, betragCSV(r.umsatz), (r.anteil * 100).toFixed(1).replace('.', ','), r.eingekauft, r.rest, r.schwund,
     r.ausverkauft ? 'ja' : '', betragCSV(r.ekPreis), r.letzter ? uhrzeit(r.letzter) : '', r.vorschlag]);
+  if (a.deckel.length) {
+    z.push([], ['Garten', 'Name', 'Rechnungs-Nr.', 'Betrag €', 'Status', 'Abgerechnet', 'Bezahlt am']);
+    for (const d of a.deckel) z.push([d.garten, d.name, d.rechnungNr, betragCSV(d.betrag), deckelStatusText(d),
+      d.abgerechnet ? new Date(d.abgerechnet).toLocaleString('de-DE') : '', d.bezahltAm ? new Date(d.bezahltAm).toLocaleDateString('de-DE') : '']);
+  }
   herunterladen(`Auswertung_${dateiname(f.name)}_${f.datum}.csv`, csv(z), 'text/csv;charset=utf-8');
 }
 function csvVerkaeufe() {
   const f = fest(ui.auswertungFestId);
-  const z = [['Bon-Nr.', 'Datum', 'Uhrzeit', 'Produkt', 'Kategorie', 'Menge', 'Einzelpreis €', 'Betrag €', 'Bon-Summe €', 'Erhalten €', 'Storniert']];
+  const z = [['Bon-Nr.', 'Datum', 'Uhrzeit', 'Produkt', 'Kategorie', 'Menge', 'Einzelpreis €', 'Betrag €', 'Bon-Summe €', 'Zahlart', 'Erhalten €', 'Garten', 'Rechnungs-Nr.', 'Storniert']];
   f.verkaeufe.forEach((v, i) => {
     const d = new Date(v.zeit);
+    const dk = v.deckelId ? f.deckel.find(x => x.id === v.deckelId) : null;
     for (const p of v.positionen) z.push([i + 1, d.toLocaleDateString('de-DE'), d.toLocaleTimeString('de-DE'), p.name, p.kategorie, p.menge,
-      betragCSV(p.preis), betragCSV(p.preis * p.menge), betragCSV(v.summe), betragCSV(v.erhalten), v.storniert ? 'ja' : '']);
+      betragCSV(p.preis), betragCSV(p.preis * p.menge), betragCSV(v.summe), dk ? 'angeschrieben' : 'bar', dk ? '' : betragCSV(v.erhalten),
+      dk?.garten ?? '', dk?.rechnungNr ?? '', v.storniert ? 'ja' : '']);
   });
   herunterladen(`Einzelverkäufe_${dateiname(f.name)}_${f.datum}.csv`, csv(z), 'text/csv;charset=utf-8');
 }
@@ -746,10 +1027,18 @@ function csvVergleich() {
 function render() {
   for (const b of $$('.nav button')) b.classList.toggle('aktiv', b.dataset.ansicht === ui.ansicht);
   $('#fest-anzeige').textContent = festAnzeige();
-  const ansichten = { kasse: renderKasse, auswertung: renderAuswertung, vergleich: renderVergleich, feste: renderFeste, produkte: renderProdukte, daten: renderDaten };
+  const ansichten = { kasse: renderKasse, deckel: renderDeckelListe, auswertung: renderAuswertung, vergleich: renderVergleich, feste: renderFeste, produkte: renderProdukte, daten: renderDaten };
   $('#inhalt').innerHTML = ansichten[ui.ansicht]();
   if (ui.ansicht === 'kasse') aktualisiereKasse();
   if (ui.ansicht === 'daten') persistStatus();
+  aktualisiereDeckelZahl();
+  renderModal();
+}
+function aktualisiereDeckelZahl() {
+  const n = offeneDeckel(aktivesFest()).length;
+  const el = $('#deckel-zahl');
+  el.hidden = !n;
+  el.textContent = n;
 }
 function wechsel(ansicht) {
   ui.ansicht = ansicht;
@@ -767,7 +1056,48 @@ function toast(text, art = '') {
 const tippen = () => navigator.vibrate?.(12);
 
 const aktionen = {
-  nav: el => { if (el.dataset.ansicht === 'feste') ui.festDetailId = null; wechsel(el.dataset.ansicht); },
+  nav: el => {
+    if (el.dataset.ansicht === 'feste') ui.festDetailId = null;
+    if (el.dataset.ansicht === 'deckel') ui.deckelId = null;
+    wechsel(el.dataset.ansicht);
+  },
+
+  // Anschreiben
+  'anschreiben-oeffnen': () => { ui.anschreiben = { garten: '', name: '' }; renderModal(); },
+  'modal-zu': () => { ui.anschreiben = null; renderModal(); },
+  'modal-zu-hg': (el, e) => { if (e.target === el) { ui.anschreiben = null; renderModal(); } },
+  ziffer: el => { if (ui.anschreiben.garten.length < 8) ui.anschreiben.garten += el.dataset.z; $('[data-feld="ans-garten"]').value = ui.anschreiben.garten; tippen(); aktualisiereAnschreiben(); },
+  'ziffer-weg': () => { ui.anschreiben.garten = ui.anschreiben.garten.slice(0, -1); $('[data-feld="ans-garten"]').value = ui.anschreiben.garten; aktualisiereAnschreiben(); },
+  'ziffer-c': () => { ui.anschreiben.garten = ''; $('[data-feld="ans-garten"]').value = ''; aktualisiereAnschreiben(); },
+  'ans-deckel': el => anschreibenAuf(aktivesFest().deckel.find(d => d.id === el.dataset.did)),
+  'ans-ok': () => anschreibenOk(),
+
+  // Deckel
+  'deckel-oeffnen': el => { ui.deckelId = el.dataset.did; ui.abrechnungErhalten = 0; wechsel('deckel'); },
+  'deckel-zurueck': () => { ui.deckelId = null; wechsel('deckel'); },
+  'abr-geld': el => { ui.abrechnungErhalten += Number(el.dataset.wert); tippen(); aktualisiereAbrechnen(); },
+  'abr-passend': () => { const r = findeDeckel(ui.deckelId); ui.abrechnungErhalten = deckelSumme(r.f, r.d); aktualisiereAbrechnen(); },
+  'abr-c': () => { ui.abrechnungErhalten = 0; aktualisiereAbrechnen(); },
+  'abr-bar': el => deckelAbrechnen(el.dataset.did, 'bar'),
+  'abr-spaeter': el => deckelAbrechnen(el.dataset.did, 'spaeter'),
+  'deckel-bezahlt': el => {
+    const { d } = findeDeckel(el.dataset.did);
+    if (!confirm(`Rechnung ${d.rechnungNr} (Garten ${d.garten}, ${euro(d.summe)}) als bezahlt markieren?`)) return;
+    d.status = 'bezahlt'; d.bezahltAm = new Date().toISOString();
+    speichern(); toast(`Rechnung ${d.rechnungNr} als bezahlt markiert`); render();
+  },
+  'deckel-storno': el => {
+    const { f } = findeDeckel(ui.deckelId);
+    stornieren(f, f.verkaeufe.find(v => v.id === el.dataset.vid));
+    ui.abrechnungErhalten = 0;
+    render();
+  },
+  'deckel-entfernen': el => {
+    const { f, d } = findeDeckel(el.dataset.did);
+    if (deckelVerkaeufe(f, d).length) return;
+    f.deckel = f.deckel.filter(x => x !== d);
+    ui.deckelId = null; speichern(); toast('Leerer Deckel entfernt'); render();
+  },
 
   // Kasse
   add: el => {
@@ -808,6 +1138,8 @@ const aktionen = {
   'fest-abschliessen': el => {
     const f = fest(el.dataset.id);
     const a = auswerten(f);
+    const od = offeneDeckel(f);
+    if (od.length) return toast(`Noch ${od.length} offene Deckel (${od.map(d => 'Garten ' + d.garten).join(', ')}). Bitte erst abrechnen, bar oder „später bezahlen".`, 'fehler');
     const fehlt = [];
     if (f.endbestand == null) fehlt.push('gezählter Kassenbestand');
     if (a.zeilen.some(z => z.eingekauft != null && z.rest == null)) fehlt.push('Restbestände');
@@ -825,7 +1157,10 @@ const aktionen = {
   'fest-oeffnen': el => { fest(el.dataset.id).abgeschlossen = false; speichern(); toast('Fest wieder geöffnet. Zum Kassieren noch „Aktiv setzen".'); render(); },
   'fest-loeschen': el => {
     const f = fest(el.dataset.id);
-    const eingabe = prompt(`Fest „${f.name}" mit ${f.verkaeufe.length} Buchungen endgültig löschen?\nZum Bestätigen den Namen des Fests eintippen:`);
+    const offenRe = f.deckel.filter(d => d.status !== 'bezahlt').length;
+    const eingabe = prompt(`Fest „${f.name}" mit ${f.verkaeufe.length} Buchungen endgültig löschen?` +
+      (offenRe ? `\nACHTUNG: ${offenRe} Deckel bzw. Rechnungen sind noch nicht bezahlt und gehen mit verloren.` : '') +
+      `\nZum Bestätigen den Namen des Fests eintippen:`);
     if (eingabe == null) return;
     if (eingabe.trim() !== f.name) return toast('Name stimmt nicht überein, nichts gelöscht', 'fehler');
     daten.feste = daten.feste.filter(x => x !== f);
@@ -896,7 +1231,7 @@ const aktionen = {
     const e = prompt('Wirklich ALLE Daten auf diesem Gerät löschen? Zum Bestätigen LÖSCHEN eintippen:');
     if (e?.trim().toUpperCase() !== 'LÖSCHEN') return;
     daten = standardDaten(); speichern();
-    Object.assign(ui, { warenkorb: [], erhalten: 0, auswertungFestId: null, vergleichIds: null, festDetailId: null });
+    Object.assign(ui, { warenkorb: [], erhalten: 0, auswertungFestId: null, vergleichIds: null, festDetailId: null, deckelId: null, anschreiben: null, abrechnungErhalten: 0 });
     toast('Alle Daten gelöscht'); render();
   },
 };
@@ -909,6 +1244,8 @@ function feldEingabe(el, ereignis) {
   const fehler = (msg, alt) => { toast(msg, 'fehler'); el.value = alt; };
 
   if (ereignis === 'input') {
+    if (feld === 'ans-garten') { ui.anschreiben.garten = el.value.slice(0, 8); aktualisiereAnschreiben(); }
+    if (feld === 'ans-name') ui.anschreiben.name = el.value;
     if (feld === 'b-eingekauft' || feld === 'b-rest') {
       const n = parseMenge(el.value);
       if (Number.isNaN(n)) return;
@@ -965,6 +1302,9 @@ function feldEingabe(el, ereignis) {
     case 'p-kat': p.kategorieId = el.value; speichern(); render(); break;
     case 'p-aktiv': p.aktiv = el.checked; speichern(); break;
     case 'vereinsname': daten.vereinsname = el.value.trim(); speichern(); break;
+    case 'rechnung-fusszeile': daten.rechnungFusszeile = el.value; speichern(); break;
+    case 'ans-garten': case 'ans-name': break;   // bereits bei 'input' übernommen
+    case 'd-name': { const r = findeDeckel(el.dataset.did); r.d.name = el.value.trim(); speichern(); break; }
     case 'auswertung-fest': ui.auswertungFestId = el.value; render(); break;
     case 'backup-import': backupImport(el.files[0]); el.value = ''; break;
   }
@@ -980,7 +1320,7 @@ async function backupImport(datei) {
     delete obj.exportiert; delete obj.appVersion;
     daten = migrieren(obj);
     speichern();
-    Object.assign(ui, { warenkorb: [], erhalten: 0, auswertungFestId: null, vergleichIds: null, festDetailId: null });
+    Object.assign(ui, { warenkorb: [], erhalten: 0, auswertungFestId: null, vergleichIds: null, festDetailId: null, deckelId: null, anschreiben: null, abrechnungErhalten: 0 });
     toast('Sicherung geladen'); render();
   } catch (e) {
     console.error(e);
@@ -999,7 +1339,12 @@ async function persistStatus() {
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-action]');
   if (!el || el.disabled) return;
-  aktionen[el.dataset.action]?.(el);
+  aktionen[el.dataset.action]?.(el, e);
+});
+document.addEventListener('keydown', e => {
+  if (!ui.anschreiben) return;
+  if (e.key === 'Escape') { ui.anschreiben = null; renderModal(); }
+  if (e.key === 'Enter' && normGarten(ui.anschreiben.garten)) { e.preventDefault(); anschreibenOk(); }
 });
 document.addEventListener('input', e => { const el = e.target.closest('[data-feld]'); if (el) feldEingabe(el, 'input'); });
 document.addEventListener('change', e => { const el = e.target.closest('[data-feld]'); if (el) feldEingabe(el, 'change'); });

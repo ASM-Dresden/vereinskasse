@@ -1,7 +1,7 @@
 /* Service Worker: macht die Vereinskasse offline nutzbar.
  * Strategie: erst Netz (max. 3 s, damit Updates ankommen), sonst Cache.
  * Bei neuen Dateien CACHE-Version erhöhen. */
-const CACHE = 'vereinskasse-v1';
+const CACHE = 'vereinskasse-v2';
 const DATEIEN = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

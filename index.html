@@ -16,6 +16,7 @@
   <div class="marke">Vereinskasse <span id="fest-anzeige" class="fest-anzeige"></span></div>
   <nav class="nav">
     <button data-action="nav" data-ansicht="kasse">Kasse</button>
+    <button data-action="nav" data-ansicht="deckel">Deckel<span id="deckel-zahl" class="zahl-badge" hidden></span></button>
     <button data-action="nav" data-ansicht="auswertung">Auswertung</button>
     <button data-action="nav" data-ansicht="vergleich">Vergleich</button>
     <button data-action="nav" data-ansicht="feste">Feste</button>
@@ -24,6 +25,7 @@
   </nav>
 </header>
 <main id="inhalt"></main>
+<div id="modal"></div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script src="app.js"></script>
 </body>
